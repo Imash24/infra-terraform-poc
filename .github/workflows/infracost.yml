@@ -1,0 +1,196 @@
+name: Infracost Cost Estimation
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '**/*.tf'
+      - '**/*.tfvars'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  TF_ROOT: "."
+
+jobs:
+  infracost:
+    name: Infracost Cost Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      # ───── 1. Checkout code ─────
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          path: base
+
+      # ───── 2. Setup Infracost ─────
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      # ───── 3. Generate BASELINE cost (main branch) ─────
+      - name: Generate Infracost baseline
+        run: |
+          infracost breakdown \
+            --path=base/${{ env.TF_ROOT }} \
+            --format=json \
+            --out-file=/tmp/infracost-base.json
+
+      # ───── 4. Generate PR branch cost (with changes) ─────
+      - name: Generate Infracost diff
+        run: |
+          infracost diff \
+            --path=${{ env.TF_ROOT }} \
+            --compare-to=/tmp/infracost-base.json \
+            --format=json \
+            --out-file=/tmp/infracost-diff.json
+
+      # ───── 5. Show human-readable output in logs ─────
+      - name: Show Infracost diff
+        run: |
+          infracost diff \
+            --path=${{ env.TF_ROOT }} \
+            --compare-to=/tmp/infracost-base.json
+
+      # ───── 6. Build FinOps API Payload ─────
+      - name: Build FinOps Payload
+        id: payload
+        run: |
+          DIFF_JSON="/tmp/infracost-diff.json"
+
+          # Extract costs
+          COST_BEFORE=$(jq -r '.pastTotalMonthlyCost // "0"' "$DIFF_JSON")
+          COST_AFTER=$(jq -r '.totalMonthlyCost // "0"' "$DIFF_JSON")
+          COST_DELTA=$(jq -r '.diffTotalMonthlyCost // "0"' "$DIFF_JSON")
+
+          # Get changed .tf files in this PR
+          FILES_CHANGED=$(git diff --name-only origin/${{ github.event.pull_request.base.ref }}...HEAD -- '*.tf' '*.tfvars' 2>/dev/null | jq -R -s -c 'split("\n") | map(select(. != ""))' || echo '[]')
+
+          # Build resources array
+          RESOURCES=$(jq -c '[
+            .projects[]?.diff?.resources[]? //empty |
+            {
+              resource_address: .name,
+              resource_type: (.resourceType // (.name | split(".") | if length > 2 then .[1] else .[0] end)),
+              provider: (.provider // "aws"),
+              change_action: (if .metadata.type == "addition" then "add"
+                             elif .metadata.type == "removal" then "delete"
+                             else "modify" end),
+              cost_before_monthly_usd: (.monthlyCost // "0"),
+              cost_after_monthly_usd: (.monthlyCost // "0"),
+              cost_delta_monthly_usd: "0",
+              cost_components: [
+                .costComponents[]? | {
+                  name: .name,
+                  unit: .unit,
+                  monthly_cost: (.monthlyCost // "0")
+                }
+              ]
+            }
+          ]' "$DIFF_JSON" 2>/dev/null || echo '[]')
+
+          # If resources is empty, try alternate path
+          if [ "$RESOURCES" = "[]" ] || [ "$RESOURCES" = "null" ]; then
+            RESOURCES=$(jq -c '[
+              .projects[]?.breakdown?.resources[]? //empty |
+              {
+                resource_address: .name,
+                resource_type: (.resourceType // (.name | split(".") | if length > 2 then .[1] else .[0] end)),
+                provider: (.provider // "aws"),
+                change_action: "add",
+                cost_before_monthly_usd: "0",
+                cost_after_monthly_usd: (.monthlyCost // "0"),
+                cost_delta_monthly_usd: (.monthlyCost // "0"),
+                cost_components: [
+                  .costComponents[]? | {
+                    name: .name,
+                    unit: .unit,
+                    monthly_cost: (.monthlyCost // "0")
+                  }
+                ]
+              }
+            ]' "$DIFF_JSON" 2>/dev/null || echo '[]')
+          fi
+
+          # Build full payload
+          PAYLOAD=$(jq -n \
+            --arg sha "${{ github.event.pull_request.head.sha }}" \
+            --arg author "${{ github.event.pull_request.user.login }}" \
+            --argjson pr_number ${{ github.event.pull_request.number }} \
+            --arg branch "${{ github.event.pull_request.head.ref }}" \
+            --arg repo "${{ github.repository }}" \
+            --arg event_type "pull_request" \
+            --arg cost_before "$COST_BEFORE" \
+            --arg cost_after "$COST_AFTER" \
+            --arg cost_delta "$COST_DELTA" \
+            --argjson files_changed "$FILES_CHANGED" \
+            --argjson resources "$RESOURCES" \
+            '{
+              commit_sha: $sha,
+              author: $author,
+              pr_number: $pr_number,
+              branch: $branch,
+              repo: $repo,
+              event_type: $event_type,
+              merged: false,
+              files_changed: $files_changed,
+              cost_before_monthly_usd: $cost_before,
+              cost_after_monthly_usd: $cost_after,
+              cost_delta_monthly_usd: $cost_delta,
+              resources: $resources
+            }')
+
+          echo "$PAYLOAD" > /tmp/finops-payload.json
+          echo "=== FinOps Payload ==="
+          echo "$PAYLOAD" | jq .
+
+          # Set output for summary
+          echo "cost_before=$COST_BEFORE" >> $GITHUB_OUTPUT
+          echo "cost_after=$COST_AFTER" >> $GITHUB_OUTPUT
+          echo "cost_delta=$COST_DELTA" >> $GITHUB_OUTPUT
+
+      # ───── 7. Upload Artifacts ─────
+      - name: Upload Infracost raw JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: infracost-output
+          path: /tmp/infracost-diff.json
+          retention-days: 90
+
+      - name: Upload FinOps Payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: finops-payload
+          path: /tmp/finops-payload.json
+          retention-days: 90
+
+      # ───── 8. Post Cost Comment on PR ─────
+      - name: Post Infracost comment on PR
+        run: |
+          infracost comment github \
+            --path=/tmp/infracost-diff.json \
+            --repo=${{ github.repository }} \
+            --github-token=${{ github.token }} \
+            --pull-request=${{ github.event.pull_request.number }} \
+            --behavior=update
+
+      # ───── 9. Job Summary ─────
+      - name: Add cost summary
+        run: |
+          echo "## 💰 Infracost Cost Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Before | \$${{ steps.payload.outputs.cost_before }}/mo |" >> $GITHUB_STEP_SUMMARY
+          echo "| After | \$${{ steps.payload.outputs.cost_after }}/mo |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Delta** | **\$${{ steps.payload.outputs.cost_delta }}/mo** |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📦 Artifacts uploaded: \`infracost-output\`, \`finops-payload\`" >> $GITHUB_STEP_SUMMARY
