@@ -180,7 +180,7 @@ jobs:
             --repo=${{ github.repository }} \
             --github-token=${{ github.token }} \
             --pull-request=${{ github.event.pull_request.number }} \
-            --behavior=update
+            --behavior=update || true
 
       # ───── 9. Job Summary ─────
       - name: Add cost summary
