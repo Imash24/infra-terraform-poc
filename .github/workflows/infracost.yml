@@ -58,7 +58,7 @@ jobs:
         run: |
           infracost diff \
             --path=${{ env.TF_ROOT }} \
-            --compare-to=/tmp/infracost-base.json
+            --compare-to=/tmp/infracost-base.json || true
 
       # ───── 6. Build FinOps API Payload ─────
       - name: Build FinOps Payload
@@ -66,15 +66,12 @@ jobs:
         run: |
           DIFF_JSON="/tmp/infracost-diff.json"
 
-          # Extract costs
           COST_BEFORE=$(jq -r '.pastTotalMonthlyCost // "0"' "$DIFF_JSON")
           COST_AFTER=$(jq -r '.totalMonthlyCost // "0"' "$DIFF_JSON")
           COST_DELTA=$(jq -r '.diffTotalMonthlyCost // "0"' "$DIFF_JSON")
 
-          # Get changed .tf files in this PR
           FILES_CHANGED=$(git diff --name-only origin/${{ github.event.pull_request.base.ref }}...HEAD -- '*.tf' '*.tfvars' 2>/dev/null | jq -R -s -c 'split("\n") | map(select(. != ""))' || echo '[]')
 
-          # Build resources array
           RESOURCES=$(jq -c '[
             .projects[]?.diff?.resources[]? //empty |
             {
@@ -97,7 +94,6 @@ jobs:
             }
           ]' "$DIFF_JSON" 2>/dev/null || echo '[]')
 
-          # If resources is empty, try alternate path
           if [ "$RESOURCES" = "[]" ] || [ "$RESOURCES" = "null" ]; then
             RESOURCES=$(jq -c '[
               .projects[]?.breakdown?.resources[]? //empty |
@@ -120,7 +116,6 @@ jobs:
             ]' "$DIFF_JSON" 2>/dev/null || echo '[]')
           fi
 
-          # Build full payload
           PAYLOAD=$(jq -n \
             --arg sha "${{ github.event.pull_request.head.sha }}" \
             --arg author "${{ github.event.pull_request.user.login }}" \
@@ -152,7 +147,6 @@ jobs:
           echo "=== FinOps Payload ==="
           echo "$PAYLOAD" | jq .
 
-          # Set output for summary
           echo "cost_before=$COST_BEFORE" >> $GITHUB_OUTPUT
           echo "cost_after=$COST_AFTER" >> $GITHUB_OUTPUT
           echo "cost_delta=$COST_DELTA" >> $GITHUB_OUTPUT
@@ -172,7 +166,7 @@ jobs:
           path: /tmp/finops-payload.json
           retention-days: 90
 
-      # ───── 8. Post Cost Comment on PR ─────
+      # ───── 8. Post Cost Comment on PR (non-blocking) ─────
       - name: Post Infracost comment on PR
         run: |
           infracost comment github \
@@ -193,4 +187,4 @@ jobs:
           echo "| After | \$${{ steps.payload.outputs.cost_after }}/mo |" >> $GITHUB_STEP_SUMMARY
           echo "| **Delta** | **\$${{ steps.payload.outputs.cost_delta }}/mo** |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "📦 Artifacts uploaded: \`infracost-output\`, \`finops-payload\`" >> $GITHUB_STEP_SUMMARY
+          echo "📦 Artifacts: \`infracost-output\`, \`finops-payload\`" >> $GITHUB_STEP_SUMMARY
