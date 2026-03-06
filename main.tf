@@ -34,3 +34,8 @@ module "ec2" {
   source      = "./modules/ec2"
   environment = var.environment
 }
+
+module "rds" {
+  source      = "./modules/rds"
+  environment = var.environment
+}
